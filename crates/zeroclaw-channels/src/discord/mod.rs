@@ -1121,12 +1121,17 @@ fn admit_discord_message(
     mention_only: bool,
     bot_user_id: &str,
 ) -> Option<String> {
-    if mention_only && !contains_bot_mention(content, bot_user_id) {
+    let normalized = content.trim().to_string();
+    if normalized.is_empty() && !has_attachments {
         return None;
     }
 
-    let normalized = content.trim().to_string();
-    if normalized.is_empty() && !has_attachments {
+    if mention_only
+        && !contains_bot_mention(content, bot_user_id)
+        && crate::orchestrator::strip_leading_channel_mention(content)
+            .map(|rest| crate::orchestrator::is_runtime_command("discord", rest))
+            != Some(true)
+    {
         return None;
     }
 
@@ -4413,6 +4418,15 @@ mod tests {
         // regardless of mention_only setting.
         assert!(admit_discord_message("", false, false, "12345").is_none());
         assert!(admit_discord_message("", false, true, "12345").is_none());
+    }
+
+    #[test]
+    fn discord_mention_only_admits_role_mention_runtime_command() {
+        assert_eq!(
+            admit_discord_message("<@&99999> !new", false, true, "12345").as_deref(),
+            Some("<@&99999> !new")
+        );
+        assert!(admit_discord_message("<@&99999> hello", false, true, "12345").is_none());
     }
 
     // mention_only DM-bypass tests

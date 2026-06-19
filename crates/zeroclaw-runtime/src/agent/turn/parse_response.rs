@@ -102,11 +102,11 @@ pub(crate) async fn interpret_chat_response(
     iteration: usize,
     detect_protocol_without_tools: bool,
 ) -> InterpretedResponse {
-    let (resp_input_tokens, resp_output_tokens) = resp
+    let (resp_input_tokens, resp_cached_input_tokens, resp_output_tokens) = resp
         .usage
         .as_ref()
-        .map(|u| (u.input_tokens, u.output_tokens))
-        .unwrap_or((None, None));
+        .map(|u| (u.input_tokens, u.cached_input_tokens, u.output_tokens))
+        .unwrap_or((None, None, None));
 
     ctx.observer.record_event(&ObserverEvent::LlmResponse {
         model_provider: ctx.provider_name.to_string(),
@@ -233,6 +233,7 @@ pub(crate) async fn interpret_chat_response(
                 "model": ctx.model,
                 "iteration": iteration + 1,
                 "input_tokens": resp_input_tokens,
+                "cached_input_tokens": resp_cached_input_tokens,
                 "output_tokens": resp_output_tokens,
                 "raw_response": scrub_credentials(&response_text),
                 "native_tool_calls": resp.tool_calls.len(),

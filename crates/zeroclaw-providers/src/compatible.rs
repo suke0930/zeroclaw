@@ -93,6 +93,26 @@ pub enum AuthStyle {
     ZhipuJwt,
 }
 
+/// Raw prompt-cache counters parsed from an OpenAI-compatible chat-completions
+/// response. This intentionally stays provider-specific: the public
+/// `TokenUsage` contract only carries the cross-provider cached-input subset,
+/// while DeepSeek live validation needs the explicit hit and miss fields.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct CompatiblePromptCacheUsage {
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub prompt_cache_hit_tokens: Option<u64>,
+    pub prompt_cache_miss_tokens: Option<u64>,
+}
+
+/// Result from the compatible-provider prompt-cache live probe path.
+#[derive(Debug, Clone, Serialize)]
+pub struct CompatiblePromptCacheProbe {
+    pub text: Option<String>,
+    pub request_body_bytes: usize,
+    pub usage: CompatiblePromptCacheUsage,
+}
+
 /// Generate a Zhipu JWT from an `id.secret` API key.
 /// Returns `Authorization: Bearer <jwt>` value. Token is valid for 3.5 minutes.
 fn zhipu_jwt_bearer(credential: &str) -> Result<String, String> {
@@ -705,6 +725,114 @@ impl OpenAiCompatibleModelProvider {
         self.merge_system_into_user || Self::model_requires_system_merge(model)
     }
 
+    /// Send a non-streaming chat-completions request through the same compatible
+    /// provider path as `ModelProvider::chat_with_history`, returning raw
+    /// DeepSeek/OpenAI-compatible cache counters for live prompt-cache evidence.
+    pub async fn chat_with_history_prompt_cache_usage(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<CompatiblePromptCacheProbe> {
+        let (chat_response, request_body_bytes) = self
+            .chat_with_history_api_response(messages, model, temperature)
+            .await?;
+        let usage = chat_response
+            .usage
+            .as_ref()
+            .ok_or_else(|| anyhow::Error::msg(format!("{} response omitted usage", self.name)))?
+            .to_prompt_cache_usage();
+        let text = Self::first_choice_text(&self.name, chat_response.choices)?;
+
+        Ok(CompatiblePromptCacheProbe {
+            text: Some(text),
+            request_body_bytes,
+            usage,
+        })
+    }
+
+    async fn chat_with_history_api_response(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<(ApiChatResponse, usize)> {
+        let credential = self.credential.as_deref();
+
+        let normalized = Self::normalize_messages_for_upstream(messages).await?;
+        let merge = self.effective_merge_system(model);
+        let effective_messages = Self::flatten_system_messages(&normalized, merge);
+        let effective_messages = self.strip_native_tool_messages(&effective_messages);
+        let api_messages: Vec<Message> = effective_messages
+            .iter()
+            .map(|m| Message {
+                role: m.role.clone(),
+                content: Self::to_message_content(&m.role, &m.content, !merge),
+            })
+            .collect();
+
+        let request = ApiChatRequest {
+            model: model.to_string(),
+            messages: api_messages,
+            temperature,
+            stream: Some(false),
+            stream_options: None,
+            reasoning_effort: self.reasoning_effort_for_model(model),
+            tool_stream: None,
+            tools: None,
+            tool_choice: None,
+            max_tokens: self.max_tokens,
+        };
+        let request_body_bytes = serde_json::to_vec(&request)?.len();
+
+        let url = self.chat_completions_url();
+        let response = match self
+            .apply_auth_header(self.http_client().post(&url).json(&request), credential)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(chat_error) => return Err(chat_error.into()),
+        };
+
+        if !response.status().is_success() {
+            return Err(super::api_error(&self.name, response).await);
+        }
+
+        let body = response.text().await?;
+        let chat_response = parse_chat_response_body(&self.name, &body)?;
+        Ok((chat_response, request_body_bytes))
+    }
+
+    fn first_choice_text(name: &str, choices: Vec<Choice>) -> anyhow::Result<String> {
+        choices
+            .into_iter()
+            .next()
+            .map(|c| {
+                if c.message.tool_calls.is_some()
+                    && c.message
+                        .tool_calls
+                        .as_ref()
+                        .is_some_and(|t: &Vec<_>| !t.is_empty())
+                {
+                    serde_json::to_string(&c.message)
+                        .unwrap_or_else(|_| c.message.effective_content())
+                } else {
+                    c.message.effective_content()
+                }
+            })
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"model_provider": name})),
+                    "compatible: empty choices in response"
+                );
+                anyhow::Error::msg(format!("No response from {name}"))
+            })
+    }
+
     fn reasoning_effort_for_model(&self, model: &str) -> Option<String> {
         let effort = self.reasoning_effort.as_ref()?;
         let id = model
@@ -803,6 +931,8 @@ struct UsageInfo {
     prompt_tokens_details: Option<PromptTokensDetails>,
     #[serde(default, deserialize_with = "deserialize_optional_token_count")]
     prompt_cache_hit_tokens: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_optional_token_count")]
+    prompt_cache_miss_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -826,6 +956,15 @@ impl UsageInfo {
             input_tokens: self.prompt_tokens,
             output_tokens: self.completion_tokens,
             cached_input_tokens,
+        }
+    }
+
+    fn to_prompt_cache_usage(&self) -> CompatiblePromptCacheUsage {
+        CompatiblePromptCacheUsage {
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            prompt_cache_hit_tokens: self.prompt_cache_hit_tokens,
+            prompt_cache_miss_tokens: self.prompt_cache_miss_tokens,
         }
     }
 }
@@ -2561,78 +2700,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let credential = self.credential.as_deref();
-
-        let normalized = Self::normalize_messages_for_upstream(messages).await?;
-        let merge = self.effective_merge_system(model);
-        let effective_messages = Self::flatten_system_messages(&normalized, merge);
-        // Strip native tool constructs for non-native-tool model_providers.
-        let effective_messages = self.strip_native_tool_messages(&effective_messages);
-        let api_messages: Vec<Message> = effective_messages
-            .iter()
-            .map(|m| Message {
-                role: m.role.clone(),
-                content: Self::to_message_content(&m.role, &m.content, !merge),
-            })
-            .collect();
-
-        let request = ApiChatRequest {
-            model: model.to_string(),
-            messages: api_messages,
-            temperature,
-            stream: Some(false),
-            stream_options: None,
-            reasoning_effort: self.reasoning_effort_for_model(model),
-            tool_stream: None,
-            tools: None,
-            tool_choice: None,
-            max_tokens: self.max_tokens,
-        };
-
-        let url = self.chat_completions_url();
-        let response = match self
-            .apply_auth_header(self.http_client().post(&url).json(&request), credential)
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(chat_error) => return Err(chat_error.into()),
-        };
-
-        if !response.status().is_success() {
-            return Err(super::api_error(&self.name, response).await);
-        }
-
-        let body = response.text().await?;
-        let chat_response = parse_chat_response_body(&self.name, &body)?;
-
-        chat_response
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| {
-                if c.message.tool_calls.is_some()
-                    && c.message
-                        .tool_calls
-                        .as_ref()
-                        .is_some_and(|t: &Vec<_>| !t.is_empty())
-                {
-                    serde_json::to_string(&c.message)
-                        .unwrap_or_else(|_| c.message.effective_content())
-                } else {
-                    c.message.effective_content()
-                }
-            })
-            .ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"model_provider": &self.name})),
-                    "compatible: empty choices in response"
-                );
-                anyhow::Error::msg(format!("No response from {}", self.name))
-            })
+        let (chat_response, _) = self
+            .chat_with_history_api_response(messages, model, temperature)
+            .await?;
+        Self::first_choice_text(&self.name, chat_response.choices)
     }
 
     async fn chat_with_tools(
@@ -4154,6 +4225,316 @@ mod tests {
         assert!(output.iter().all(|m| m.role != "system"));
     }
 
+    struct DeepSeekWireProbe {
+        body: String,
+        stable_system_offset: usize,
+        stable_history_offset: usize,
+        stable_history_end_offset: usize,
+        volatile_context_offset: usize,
+        volatile_memory_offset: usize,
+        volatile_message_id_offset: usize,
+        current_user_offset: usize,
+    }
+
+    async fn deepseek_chat_completions_wire_probe(
+        provider: &OpenAiCompatibleModelProvider,
+        messages: &[ChatMessage],
+        model: &str,
+    ) -> DeepSeekWireProbe {
+        let normalized = OpenAiCompatibleModelProvider::normalize_messages_for_upstream(messages)
+            .await
+            .unwrap();
+        let merge = provider.effective_merge_system(model);
+        let effective_messages =
+            OpenAiCompatibleModelProvider::flatten_system_messages(&normalized, merge);
+        let effective_messages = provider.strip_native_tool_messages(&effective_messages);
+        let api_messages: Vec<Message> = effective_messages
+            .iter()
+            .map(|m| Message {
+                role: m.role.clone(),
+                content: OpenAiCompatibleModelProvider::to_message_content(
+                    &m.role, &m.content, !merge,
+                ),
+            })
+            .collect();
+
+        let request = ApiChatRequest {
+            model: model.to_string(),
+            messages: api_messages,
+            temperature: Some(0.0),
+            stream: Some(false),
+            stream_options: None,
+            reasoning_effort: provider.reasoning_effort_for_model(model),
+            tool_stream: None,
+            tools: None,
+            tool_choice: None,
+            max_tokens: provider.max_tokens,
+        };
+        let body = serde_json::to_string(&request).unwrap();
+
+        DeepSeekWireProbe {
+            stable_system_offset: marker_offset(&body, "STABLE_SYSTEM_MARKER"),
+            stable_history_offset: marker_offset(&body, "STABLE_HISTORY_MARKER"),
+            stable_history_end_offset: marker_offset(&body, "STABLE_HISTORY_END_MARKER"),
+            volatile_context_offset: marker_offset(&body, "<zeroclaw_current_context>"),
+            volatile_memory_offset: marker_offset(&body, "VOLATILE_MEMORY_MARKER"),
+            volatile_message_id_offset: marker_offset(&body, "VOLATILE_MESSAGE_ID_MARKER"),
+            current_user_offset: marker_offset(&body, "CURRENT_USER_MARKER"),
+            body,
+        }
+    }
+
+    fn marker_offset(body: &str, marker: &str) -> usize {
+        body.find(marker)
+            .unwrap_or_else(|| panic!("serialized request body must contain {marker}; body={body}"))
+    }
+
+    fn first_differing_byte(left: &str, right: &str) -> Option<usize> {
+        let left = left.as_bytes();
+        let right = right.as_bytes();
+        left.iter()
+            .zip(right.iter())
+            .position(|(left, right)| left != right)
+            .or_else(|| (left.len() != right.len()).then_some(left.len().min(right.len())))
+    }
+
+    fn classify_first_diff_marker(probe: &DeepSeekWireProbe, first_diff: usize) -> &'static str {
+        let volatile_or_current_offset =
+            probe.current_user_offset.min(probe.volatile_context_offset);
+        if first_diff >= volatile_or_current_offset {
+            "VOLATILE_CONTEXT_OR_CURRENT_USER"
+        } else if first_diff >= probe.stable_history_offset {
+            "STABLE_HISTORY"
+        } else if first_diff >= probe.stable_system_offset {
+            "STABLE_SYSTEM"
+        } else {
+            "REQUEST_METADATA"
+        }
+    }
+
+    fn stable_history_fixture(
+        volatile_memory: &str,
+        message_id: &str,
+        current_user: &str,
+    ) -> Vec<ChatMessage> {
+        let stable_history = format!(
+            "STABLE_HISTORY_MARKER {} STABLE_HISTORY_END_MARKER",
+            "stable historical transcript. ".repeat(900)
+        );
+        let current_user_content = format!(
+            "CURRENT_USER_MARKER {current_user}\n\n\
+             <zeroclaw_current_context>\n\
+             VOLATILE_MEMORY_MARKER {volatile_memory}\n\
+             VOLATILE_MESSAGE_ID_MARKER {message_id}\n\
+             </zeroclaw_current_context>"
+        );
+
+        vec![
+            ChatMessage::system(format!(
+                "STABLE_SYSTEM_MARKER {}",
+                "stable daemon and tool policy. ".repeat(300)
+            )),
+            ChatMessage::user(stable_history),
+            ChatMessage::assistant("stable assistant acknowledgement"),
+            ChatMessage::user(current_user_content),
+        ]
+    }
+
+    fn assert_identical_marker_offsets(left: &DeepSeekWireProbe, right: &DeepSeekWireProbe) {
+        assert_eq!(left.stable_system_offset, right.stable_system_offset);
+        assert_eq!(left.stable_history_offset, right.stable_history_offset);
+        assert_eq!(
+            left.stable_history_end_offset,
+            right.stable_history_end_offset
+        );
+        assert_eq!(left.volatile_context_offset, right.volatile_context_offset);
+        assert_eq!(left.volatile_memory_offset, right.volatile_memory_offset);
+        assert_eq!(
+            left.volatile_message_id_offset,
+            right.volatile_message_id_offset
+        );
+        assert_eq!(left.current_user_offset, right.current_user_offset);
+    }
+
+    #[tokio::test]
+    async fn compatible_provider_deepseek_cache_boundary() {
+        let provider = make_model_provider("DeepSeek", "https://api.deepseek.example/v1", None);
+        let model = "deepseek-v3.2-exp";
+        let baseline = deepseek_chat_completions_wire_probe(
+            &provider,
+            &stable_history_fixture(
+                "memory-alpha-stays-out-of-system",
+                "message-alpha-stays-out-of-system",
+                "current-user-alpha",
+            ),
+            model,
+        )
+        .await;
+        let changed_memory = deepseek_chat_completions_wire_probe(
+            &provider,
+            &stable_history_fixture(
+                "memory-bravo-stays-out-of-system",
+                "message-alpha-stays-out-of-system",
+                "current-user-alpha",
+            ),
+            model,
+        )
+        .await;
+        let changed_message_id = deepseek_chat_completions_wire_probe(
+            &provider,
+            &stable_history_fixture(
+                "memory-alpha-stays-out-of-system",
+                "message-bravo-stays-out-of-system",
+                "current-user-alpha",
+            ),
+            model,
+        )
+        .await;
+        let changed_all_volatile = deepseek_chat_completions_wire_probe(
+            &provider,
+            &stable_history_fixture(
+                "memory-bravo-stays-out-of-system",
+                "message-bravo-stays-out-of-system",
+                "current-user-bravo",
+            ),
+            model,
+        )
+        .await;
+
+        assert_identical_marker_offsets(&baseline, &changed_memory);
+        assert_identical_marker_offsets(&baseline, &changed_message_id);
+        assert_identical_marker_offsets(&baseline, &changed_all_volatile);
+
+        let first_diff = first_differing_byte(&baseline.body, &changed_all_volatile.body)
+            .expect("synthetic volatile markers must produce differing final payloads");
+        let memory_diff = first_differing_byte(&baseline.body, &changed_memory.body)
+            .expect("synthetic volatile memory must produce differing final payloads");
+        let message_id_diff = first_differing_byte(&baseline.body, &changed_message_id.body)
+            .expect("synthetic volatile message id must produce differing final payloads");
+        let stable_prefix_token_estimate = first_diff / 4;
+        let first_diff_marker = classify_first_diff_marker(&baseline, first_diff);
+        let memory_diff_first_marker = classify_first_diff_marker(&baseline, memory_diff);
+        let message_id_diff_first_marker = classify_first_diff_marker(&baseline, message_id_diff);
+
+        println!("FINAL_WIRE_PAYLOAD=present");
+        println!("PREFIX_BOUNDARY_STATUS=volatile_after_stable_history");
+        println!("FIRST_DIFF_BYTE={first_diff}");
+        println!("first_diff_byte = {first_diff}");
+        println!("first_diff_marker = {first_diff_marker}");
+        println!("memory_diff_first_byte = {memory_diff}");
+        println!("memory_diff_first_marker = {memory_diff_first_marker}");
+        println!("message_id_diff_first_byte = {message_id_diff}");
+        println!("message_id_diff_first_marker = {message_id_diff_first_marker}");
+        println!("STABLE_PREFIX_TOKEN_ESTIMATE={stable_prefix_token_estimate}");
+        println!("stable_prefix_tokens_estimate = {stable_prefix_token_estimate}");
+        println!(
+            "STABLE_SYSTEM_MARKER_OFFSET={}",
+            baseline.stable_system_offset
+        );
+        println!(
+            "STABLE_HISTORY_MARKER_OFFSET={}",
+            baseline.stable_history_offset
+        );
+        println!(
+            "STABLE_HISTORY_END_MARKER_OFFSET={}",
+            baseline.stable_history_end_offset
+        );
+        println!(
+            "VOLATILE_CONTEXT_MARKER_OFFSET={}",
+            baseline.volatile_context_offset
+        );
+        println!(
+            "VOLATILE_MEMORY_MARKER_OFFSET={}",
+            baseline.volatile_memory_offset
+        );
+        println!(
+            "VOLATILE_MESSAGE_ID_MARKER_OFFSET={}",
+            baseline.volatile_message_id_offset
+        );
+        println!(
+            "CURRENT_USER_MARKER_OFFSET={}",
+            baseline.current_user_offset
+        );
+
+        let body_value: serde_json::Value = serde_json::from_str(&baseline.body).unwrap();
+        let messages = body_value["messages"]
+            .as_array()
+            .expect("final request body must serialize messages as an array");
+        assert!(
+            messages
+                .iter()
+                .all(|message| message["role"].as_str() != Some("system")),
+            "DeepSeek V3-family final wire payload must have system text merged before send: {}",
+            baseline.body
+        );
+        assert!(
+            baseline.stable_system_offset < baseline.stable_history_offset,
+            "stable system text should be merged before stable history. body={}",
+            baseline.body
+        );
+        assert!(
+            baseline.stable_history_offset < baseline.stable_history_end_offset,
+            "stable history end marker must close the stable history prefix. body={}",
+            baseline.body
+        );
+        assert!(
+            baseline.stable_history_end_offset < baseline.current_user_offset,
+            "current user marker must be serialized after stable history. body={}",
+            baseline.body
+        );
+        assert!(
+            baseline.current_user_offset < baseline.volatile_context_offset,
+            "volatile context must be serialized after stable current-user bytes. body={}",
+            baseline.body
+        );
+        assert!(
+            baseline.volatile_context_offset < baseline.volatile_memory_offset,
+            "volatile memory marker must live inside current-user volatile context. body={}",
+            baseline.body
+        );
+        assert!(
+            baseline.volatile_memory_offset < baseline.volatile_message_id_offset,
+            "message id marker should follow memory marker in volatile context. body={}",
+            baseline.body
+        );
+        assert!(
+            baseline.current_user_offset < baseline.volatile_message_id_offset,
+            "volatile message id marker should follow current user bytes. body={}",
+            baseline.body
+        );
+        assert_eq!(
+            first_diff_marker, "VOLATILE_CONTEXT_OR_CURRENT_USER",
+            "first diff must not occur in request metadata, system, or stable history"
+        );
+        assert_eq!(
+            memory_diff_first_marker, "VOLATILE_CONTEXT_OR_CURRENT_USER",
+            "memory-only diff must not occur in system or stable history"
+        );
+        assert_eq!(
+            message_id_diff_first_marker, "VOLATILE_CONTEXT_OR_CURRENT_USER",
+            "message-id-only diff must not occur in system or stable history"
+        );
+        assert!(
+            first_diff > baseline.stable_history_end_offset,
+            "first final-wire diff must be after stable history. body={}",
+            baseline.body
+        );
+        assert!(
+            memory_diff >= baseline.volatile_memory_offset,
+            "memory diff must start at or after the volatile memory marker. body={}",
+            baseline.body
+        );
+        assert!(
+            message_id_diff >= baseline.volatile_message_id_offset,
+            "message id diff must start at or after the volatile message id marker. body={}",
+            baseline.body
+        );
+        assert!(
+            stable_prefix_token_estimate >= 2048,
+            "long-history fixture must provide at least a 2048-token stable prefix; got {stable_prefix_token_estimate}"
+        );
+    }
+
     #[test]
     fn flatten_system_messages_inserts_user_when_missing() {
         let input = vec![
@@ -5318,11 +5699,16 @@ mod tests {
                 "prompt_tokens": 150,
                 "completion_tokens": 60,
                 "prompt_cache_hit_tokens": 100,
+                "prompt_cache_miss_tokens": 50,
                 "prompt_tokens_details": {"cached_tokens": 80}
             }
         }"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
-        let usage = resp.usage.unwrap().into_provider_usage();
+        let raw_usage = resp.usage.unwrap();
+        let prompt_cache_usage = raw_usage.to_prompt_cache_usage();
+        assert_eq!(prompt_cache_usage.prompt_cache_hit_tokens, Some(100));
+        assert_eq!(prompt_cache_usage.prompt_cache_miss_tokens, Some(50));
+        let usage = raw_usage.into_provider_usage();
         assert_eq!(usage.cached_input_tokens, Some(100));
     }
 

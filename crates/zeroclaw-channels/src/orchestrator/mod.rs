@@ -104,6 +104,7 @@ pub use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
 pub use zeroclaw_infra::stall_watchdog::StallWatchdog;
 
 use anyhow::{Context, Result};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use parking_lot::RwLock;
 use portable_atomic::{AtomicU64, Ordering};
 use serde::Deserialize;
@@ -862,22 +863,12 @@ fn build_channel_system_prompt_for_message(
     target_channel: Option<&Arc<dyn Channel>>,
 ) -> String {
     let bot_mention = target_channel.and_then(|c| c.self_addressed_mention());
-    build_channel_system_prompt(
-        base_prompt,
-        &msg.channel,
-        &msg.reply_target,
-        &msg.sender,
-        &msg.id,
-        bot_mention.as_deref(),
-    )
+    build_channel_system_prompt(base_prompt, &msg.channel, bot_mention.as_deref())
 }
 
 fn build_channel_system_prompt(
     base_prompt: &str,
     channel_name: &str,
-    reply_target: &str,
-    sender: &str,
-    message_id: &str,
     bot_mention: Option<&str>,
 ) -> String {
     let mut prompt = base_prompt.to_string();
@@ -903,6 +894,30 @@ fn build_channel_system_prompt(
         prompt.push_str(&block);
     }
 
+    prompt
+}
+
+fn build_channel_current_context_for_message(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> String {
+    build_channel_current_context(&msg.channel, &msg.reply_target, &msg.sender, &msg.id)
+}
+
+fn build_channel_current_context(
+    channel_name: &str,
+    reply_target: &str,
+    sender: &str,
+    message_id: &str,
+) -> String {
+    let mut context = format!(
+        "Channel context: You are currently responding on channel={channel_name}, \
+         reply_target={reply_target}, sender={sender}, message_id={message_id}. \
+         The sender field is the platform-specific user ID of the person who sent \
+         this message. Use it to distinguish between different users. \
+         The message_id field identifies this incoming message; pass it as the \
+         `message_id` argument when calling the `reaction` tool."
+    );
+
     if !reply_target.is_empty() {
         // For most channels, `reply_target` is the address to send to (channel/room
         // ID for Slack/Discord/Matrix, peer ID for Telegram/Signal). The webhook
@@ -922,24 +937,91 @@ fn build_channel_system_prompt(
                  \"to\":\"{reply_target}\"}}"
             )
         };
-        let context = format!(
-            "\n\nChannel context: You are currently responding on channel={channel_name}, \
-             reply_target={reply_target}, sender={sender}, message_id={message_id}. \
-             The sender field is the platform-specific user ID of the person who sent \
-             this message. Use it to distinguish between different users. \
-             The message_id field identifies this incoming message; pass it as the \
-             `message_id` argument when calling the `reaction` tool. \
-             When scheduling delayed messages or reminders \
-             via cron_add for this conversation, use {delivery_hint} so the message \
-             reaches the user.\n\nCalibration note: agents in this system currently err \
-             on the side of silence when a response would be appropriate, which users \
-             find frustrating. Skew toward replying. Memory is supplementary context \
-             that informs how you respond, not a gate on whether you respond."
+        let _ = write!(
+            context,
+            " When scheduling delayed messages or reminders via cron_add for this \
+             conversation, use {delivery_hint} so the message reaches the user."
         );
-        prompt.push_str(&context);
     }
 
-    prompt
+    context.push_str(
+        "\n\nCalibration note: agents in this system currently err on the side of \
+         silence when a response would be appropriate, which users find \
+         frustrating. Skew toward replying. Memory is supplementary context \
+         that informs how you respond, not a gate on whether you respond.",
+    );
+
+    context
+}
+
+fn build_volatile_current_context(
+    channel_context: &str,
+    memory_context: &str,
+    peer_map: Option<&str>,
+) -> String {
+    let mut context = String::from("<zeroclaw_current_context>\n");
+    context.push_str(channel_context.trim());
+
+    let memory_context = memory_context.trim();
+    if !memory_context.is_empty() {
+        context.push_str("\n\n");
+        context.push_str(memory_context);
+    }
+
+    if let Some(peer_map) = peer_map
+        .map(str::trim)
+        .filter(|peer_map| !peer_map.is_empty())
+    {
+        context.push_str("\n\n");
+        context.push_str(peer_map);
+    }
+
+    context.push_str("\n</zeroclaw_current_context>");
+    context
+}
+
+fn append_volatile_context_to_current_user_turn(turns: &mut [ChatMessage], volatile_context: &str) {
+    if let Some(turn) = turns.iter_mut().rev().find(|turn| turn.role == "user") {
+        let original = std::mem::take(&mut turn.content);
+        turn.content = if original.is_empty() {
+            volatile_context.to_string()
+        } else {
+            format!("{original}\n\n{volatile_context}")
+        };
+    }
+}
+
+fn current_turn_provider_content(
+    content: &str,
+    attachments: &[zeroclaw_api::media::MediaAttachment],
+    vision_available: bool,
+) -> String {
+    if !vision_available || attachments.is_empty() || content.contains("[IMAGE:") {
+        return content.to_string();
+    }
+
+    let mut image_blocks = Vec::new();
+    for attachment in attachments
+        .iter()
+        .filter(|attachment| attachment.kind() == zeroclaw_api::media::MediaKind::Image)
+    {
+        let mime = attachment.mime_type.as_deref().unwrap_or("image/jpeg");
+        let b64 = BASE64_STANDARD.encode(&attachment.data);
+        image_blocks.push(format!(
+            "[Image: {} attached]\n[IMAGE:data:{};base64,{}]",
+            attachment.file_name, mime, b64
+        ));
+    }
+
+    if image_blocks.is_empty() {
+        return content.to_string();
+    }
+
+    if content.trim().is_empty() {
+        image_blocks.join("\n")
+    } else {
+        format!("{}\n\n{}", image_blocks.join("\n"), content)
+    }
 }
 
 fn current_date_section() -> String {
@@ -1129,13 +1211,42 @@ fn is_matrix_channel_name(channel_name: &str) -> bool {
     channel_name == "matrix" || channel_name.starts_with("matrix:")
 }
 
-fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
-    let trimmed = content.trim();
-    if !trimmed.starts_with('/') {
+pub(crate) fn strip_leading_channel_mention(text: &str) -> Option<&str> {
+    let trimmed = text.trim_start();
+    let rest = trimmed.strip_prefix("<@")?;
+    let rest = if let Some(rest) = rest.strip_prefix('!') {
+        rest
+    } else if let Some(rest) = rest.strip_prefix('&') {
+        rest
+    } else {
+        rest
+    };
+
+    let digit_count = rest.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    if digit_count == 0 {
         return None;
     }
 
-    let mut parts = trimmed.split_whitespace();
+    let rest = &rest[digit_count..];
+    rest.strip_prefix('>').map(str::trim_start)
+}
+
+fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
+    let mut trimmed = content.trim();
+    if channel_name == "discord" {
+        trimmed = strip_leading_channel_mention(trimmed).unwrap_or(trimmed);
+    }
+
+    let trimmed = trimmed.trim_start();
+    let command_body = if let Some(rest) = trimmed.strip_prefix('/') {
+        rest
+    } else if channel_name == "discord" {
+        trimmed.strip_prefix('!')?
+    } else {
+        return None;
+    };
+
+    let mut parts = command_body.split_whitespace();
     let command_token = parts.next()?;
     let base_command = command_token
         .split('@')
@@ -1145,8 +1256,8 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
 
     match base_command.as_str() {
         // `/new` and bare `/clear` are available on every channel — no model-switch gate.
-        "/new" => Some(ChannelRuntimeCommand::NewSession),
-        "/clear" => {
+        "new" => Some(ChannelRuntimeCommand::NewSession),
+        "clear" => {
             if parts.next().is_none() {
                 Some(ChannelRuntimeCommand::NewSession)
             } else {
@@ -1154,7 +1265,7 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
             }
         }
         // Model/model_provider switching is channel-gated.
-        "/models" if supports_runtime_model_switch(channel_name) => {
+        "models" if supports_runtime_model_switch(channel_name) => {
             if let Some(model_provider) = parts.next() {
                 Some(ChannelRuntimeCommand::SetProvider(
                     model_provider.trim().to_string(),
@@ -1163,7 +1274,7 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 Some(ChannelRuntimeCommand::ShowProviders)
             }
         }
-        "/model" if supports_runtime_model_switch(channel_name) => {
+        "model" if supports_runtime_model_switch(channel_name) => {
             let model = parts.collect::<Vec<_>>().join(" ").trim().to_string();
             if model.is_empty() {
                 Some(ChannelRuntimeCommand::ShowModel)
@@ -1171,11 +1282,15 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 Some(ChannelRuntimeCommand::SetModel(model))
             }
         }
-        "/config" if supports_runtime_model_switch(channel_name) => {
+        "config" if supports_runtime_model_switch(channel_name) => {
             Some(ChannelRuntimeCommand::ShowConfig)
         }
         _ => None,
     }
+}
+
+pub(crate) fn is_runtime_command(channel_name: &str, content: &str) -> bool {
+    parse_runtime_command(channel_name, content).is_some()
 }
 
 /// Verify `name` matches a canonical model provider family known to the
@@ -1756,20 +1871,11 @@ fn extract_current_turn_tool_messages(history: &[ChatMessage]) -> Vec<ChatMessag
         .collect()
 }
 
-/// Remove tool-role and intermediate assistant tool-call messages from
-/// conversation turns older than the most recent `keep_turns` user→assistant
-/// exchanges.  This prevents unbounded history growth while preserving
-/// tool context for the N most recent turns.
-fn strip_old_tool_context(ctx: &ChannelRuntimeContext, sender_key: &str, keep_turns: usize) {
-    let mut histories = ctx
-        .conversation_histories
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-
-    let Some(turns) = histories.get_mut(sender_key) else {
-        return;
-    };
-
+/// Remove tool-role and intermediate assistant tool-call messages from a
+/// provider send copy when they are older than the most recent `keep_turns`
+/// user→assistant exchanges. Persisted conversation history remains append-only;
+/// this helper only mutates the cloned send-time projection passed to it.
+fn strip_old_tool_context(turns: &mut Vec<ChatMessage>, keep_turns: usize) {
     // Walk backwards to find the oldest user message that still belongs to the
     // most recent `keep_turns` exchanges. Everything before that boundary is
     // old enough to strip. If the session has fewer than `keep_turns` user
@@ -4002,7 +4108,12 @@ async fn process_channel_message_body(
             return;
         }
     };
-    let history_user_content = channel_history_content_for_user_turn(&msg.content);
+    let provider_user_content = current_turn_provider_content(
+        &msg.content,
+        &msg.attachments,
+        active_model_provider.supports_vision(),
+    );
+    let history_user_content = channel_history_content_for_user_turn(&provider_user_content);
     if ctx.auto_save_memory
         && history_user_content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
         && !zeroclaw_memory::should_skip_autosave_content(&history_user_content)
@@ -4047,7 +4158,7 @@ async fn process_channel_message_body(
     // Preserve the dated user turn before the LLM call so interrupted requests
     // keep the same temporal context as CLI turns. Keep history compact so
     // inline image payloads are not reloaded into later requests.
-    let timestamped_content = timestamp_channel_user_content(&msg.content);
+    let timestamped_content = timestamp_channel_user_content(&provider_user_content);
     let timestamped_history_content = timestamp_channel_user_content(&history_user_content);
     append_sender_turn(
         ctx.as_ref(),
@@ -4074,6 +4185,10 @@ async fn process_channel_message_body(
         );
     }
     let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
+    let keep_tool_turns = ctx.agent_cfg.resolved.keep_tool_context_turns;
+    if keep_tool_turns > 0 {
+        strip_old_tool_context(&mut prior_turns, keep_tool_turns);
+    }
 
     // Strip stale tool_result blocks from cached turns so the LLM never
     // sees a `<tool_result>` without a preceding `<tool_call>`, which
@@ -4147,16 +4262,17 @@ async fn process_channel_message_body(
         format!("{sender_memory}\n{group_memory}")
     };
 
-    // Use refreshed system prompt for new sessions (master's /new support),
-    // and inject memory into system prompt (not user message) so it
-    // doesn't pollute session history and is re-fetched each turn.
+    // Use a refreshed stable system prompt for new sessions (master's /new
+    // support), then attach recalled memory and current-turn channel context to
+    // the send-time current user clone so volatile bytes stay out of history.
     let base_system_prompt = if had_prior_history {
         ctx.system_prompt.as_str().to_string()
     } else {
         refreshed_new_session_system_prompt(ctx.as_ref())
     };
-    let mut system_prompt =
+    let system_prompt =
         build_channel_system_prompt_for_message(&base_system_prompt, &msg, target_channel.as_ref());
+    let mut peer_map_context = None;
     if send_message_to_peer_tool_available(ctx.as_ref(), &msg)
         && let Some(current_channel_ref) = peer_prompt_channel_ref(ctx.as_ref(), &msg)
     {
@@ -4167,12 +4283,15 @@ async fn process_channel_message_body(
                 &current_channel_ref,
             );
         if !peer_map.is_empty() {
-            let _ = write!(system_prompt, "\n\n{peer_map}");
+            peer_map_context = Some(peer_map);
         }
     }
-    if !memory_context.is_empty() {
-        let _ = write!(system_prompt, "\n\n{memory_context}");
-    }
+    let volatile_context = build_volatile_current_context(
+        &build_channel_current_context_for_message(&msg),
+        &memory_context,
+        peer_map_context.as_deref(),
+    );
+    append_volatile_context_to_current_user_turn(&mut prior_turns, &volatile_context);
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
 
@@ -4911,7 +5030,6 @@ async fn process_channel_message_body(
             // Persist intermediate tool-call/result messages from this turn
             // so the model retains concrete "I used tools" examples in
             // context, preventing drift toward tool-less responses.
-            let keep_tool_turns = ctx.agent_cfg.resolved.keep_tool_context_turns;
             if keep_tool_turns > 0 {
                 // Find tool messages for the current turn: everything after
                 // the last user message up to (but not including) the final
@@ -4928,12 +5046,6 @@ async fn process_channel_message_body(
                 &history_key,
                 ChatMessage::assistant(&history_response),
             );
-
-            // Strip tool-call messages from turns older than
-            // keep_tool_context_turns to prevent unbounded growth.
-            if keep_tool_turns > 0 {
-                strip_old_tool_context(ctx.as_ref(), &history_key, keep_tool_turns);
-            }
 
             // Fire-and-forget LLM-driven memory consolidation. Passes the
             // agent's resolved temperature through unchanged — `None`
@@ -9601,6 +9713,479 @@ fn expand_tilde_in_path(path: &str) -> PathBuf {
     PathBuf::from(shellexpand::tilde(path).as_ref())
 }
 
+#[doc(hidden)]
+pub mod discord_cache_validation_support {
+    use super::*;
+
+    const STABLE_SYSTEM_MARKER: &str = "TASK8_STABLE_SYSTEM_MARKER";
+    const STABLE_HISTORY_MARKER_BEGIN: &str = "TASK8_STABLE_HISTORY_MARKER_BEGIN";
+    const STABLE_HISTORY_MARKER_END: &str = "TASK8_STABLE_HISTORY_MARKER_END";
+    const VOLATILE_MEMORY_MARKER: &str = "TASK8_VOLATILE_MEMORY_MARKER";
+    const VOLATILE_MESSAGE_ID_MARKER: &str = "TASK8_VOLATILE_MESSAGE_ID_MARKER";
+    const CURRENT_USER_MARKER: &str = "TASK8_CURRENT_USER_MARKER";
+
+    #[derive(Debug, Clone, ::serde::Serialize)]
+    pub struct RuntimeCommandContract {
+        pub discord_bang_new_supported: bool,
+        pub discord_role_mention_bang_new_supported: bool,
+        pub telegram_bang_new_supported: bool,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct ProviderPayloadCapture {
+        pub turns: Vec<(String, String)>,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct DaemonEquivalentCacheProbe {
+        pub provider_calls: Vec<ProviderPayloadCapture>,
+        pub message_ids: [String; 2],
+        pub synthetic_memory_entries: Vec<String>,
+        pub stable_prefix_bytes: usize,
+        pub stable_prefix_tokens_estimate: usize,
+        pub first_diff_marker: String,
+        pub memory_diff_first_marker: String,
+        pub message_id_diff_first_marker: String,
+        pub runtime_command_contract: RuntimeCommandContract,
+    }
+
+    struct ProbeVariant<'a> {
+        memory_marker: &'a str,
+        message_id_marker: &'a str,
+        current_user_marker: &'a str,
+    }
+
+    #[derive(Default)]
+    struct CaptureModelProvider {
+        calls: Mutex<Vec<Vec<(String, String)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for CaptureModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("task8-fallback-response".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            let snapshot = messages
+                .iter()
+                .map(|message| (message.role.clone(), message.content.clone()))
+                .collect::<Vec<_>>();
+            let mut calls = self.calls.lock().unwrap_or_else(|err| err.into_inner());
+            calls.push(snapshot);
+            Ok(format!("task8-fallback-response-{}", calls.len()))
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for CaptureModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "Task8CaptureModelProvider"
+        }
+    }
+
+    #[derive(Default)]
+    struct SyntheticDiscordChannel {
+        sent: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for SyntheticDiscordChannel {
+        fn name(&self) -> &str {
+            "discord"
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent
+                .lock()
+                .await
+                .push(format!("{}:{}", message.recipient, message.content));
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for SyntheticDiscordChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Discord,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "task8"
+        }
+    }
+
+    struct ValidationObserver;
+
+    impl Observer for ValidationObserver {
+        fn record_event(&self, _event: &ObserverEvent) {}
+
+        fn record_metric(&self, _metric: &ObserverMetric) {}
+
+        fn name(&self) -> &str {
+            "task8-validation-observer"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    pub async fn run_daemon_equivalent_cache_probe() -> anyhow::Result<DaemonEquivalentCacheProbe> {
+        let baseline = ProbeVariant {
+            memory_marker: "alpha-memory-stays-volatile",
+            message_id_marker: "alpha-message-stays-volatile",
+            current_user_marker: "alpha-current-user",
+        };
+        let changed_memory = ProbeVariant {
+            memory_marker: "bravo-memory-stays-volatile",
+            message_id_marker: "alpha-message-stays-volatile",
+            current_user_marker: "alpha-current-user",
+        };
+        let changed_message_id = ProbeVariant {
+            memory_marker: "alpha-memory-stays-volatile",
+            message_id_marker: "bravo-message-stays-volatile",
+            current_user_marker: "alpha-current-user",
+        };
+        let changed_all = ProbeVariant {
+            memory_marker: "bravo-memory-stays-volatile",
+            message_id_marker: "bravo-message-stays-volatile",
+            current_user_marker: "bravo-current-user",
+        };
+
+        let baseline_capture = capture_variant(&baseline).await?;
+        let changed_memory_capture = capture_variant(&changed_memory).await?;
+        let changed_message_id_capture = capture_variant(&changed_message_id).await?;
+        let changed_all_capture = capture_variant(&changed_all).await?;
+
+        let baseline_body = serde_json::to_string(&baseline_capture.turns)?;
+        let changed_memory_body = serde_json::to_string(&changed_memory_capture.turns)?;
+        let changed_message_id_body = serde_json::to_string(&changed_message_id_capture.turns)?;
+        let changed_all_body = serde_json::to_string(&changed_all_capture.turns)?;
+
+        let first_diff = first_differing_byte(&baseline_body, &changed_all_body)
+            .context("changed-all provider payload must differ from baseline")?;
+        let memory_diff = first_differing_byte(&baseline_body, &changed_memory_body)
+            .context("changed-memory provider payload must differ from baseline")?;
+        let message_id_diff = first_differing_byte(&baseline_body, &changed_message_id_body)
+            .context("changed-message-id provider payload must differ from baseline")?;
+
+        let markers = PayloadMarkers::from_body(&baseline_body)?;
+
+        Ok(DaemonEquivalentCacheProbe {
+            provider_calls: vec![
+                baseline_capture,
+                changed_memory_capture,
+                changed_message_id_capture,
+                changed_all_capture,
+            ],
+            message_ids: [
+                format!(
+                    "{VOLATILE_MESSAGE_ID_MARKER}-{}",
+                    baseline.message_id_marker
+                ),
+                format!(
+                    "{VOLATILE_MESSAGE_ID_MARKER}-{}",
+                    changed_all.message_id_marker
+                ),
+            ],
+            synthetic_memory_entries: vec![
+                format!("{VOLATILE_MEMORY_MARKER}-{}", baseline.memory_marker),
+                format!("{VOLATILE_MEMORY_MARKER}-{}", changed_all.memory_marker),
+            ],
+            stable_prefix_bytes: first_diff,
+            stable_prefix_tokens_estimate: first_diff / 4,
+            first_diff_marker: markers.classify(first_diff).to_string(),
+            memory_diff_first_marker: markers.classify(memory_diff).to_string(),
+            message_id_diff_first_marker: markers.classify(message_id_diff).to_string(),
+            runtime_command_contract: RuntimeCommandContract {
+                discord_bang_new_supported: is_runtime_command("discord", "!new"),
+                discord_role_mention_bang_new_supported: is_runtime_command(
+                    "discord",
+                    "<@&123456789012345678> !new",
+                ),
+                telegram_bang_new_supported: is_runtime_command("telegram", "!new"),
+            },
+        })
+    }
+
+    async fn capture_variant(variant: &ProbeVariant<'_>) -> anyhow::Result<ProviderPayloadCapture> {
+        let workspace_dir = validation_workspace_dir(variant)?;
+        std::fs::create_dir_all(&workspace_dir).with_context(|| {
+            format!(
+                "creating validation workspace {}",
+                workspace_dir.to_string_lossy()
+            )
+        })?;
+
+        let channel_impl = Arc::new(SyntheticDiscordChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl;
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(CaptureModelProvider::default());
+        let memory: Arc<dyn Memory> = Arc::new(zeroclaw_memory::SqliteMemory::new(
+            "task8_daemon_equivalent_cache_validation",
+            &workspace_dir,
+        )?);
+        let memory_strategy =
+            zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                Arc::clone(&memory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                workspace_dir.clone(),
+            );
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: provider_impl.clone(),
+            model_provider_ref: Arc::new("task8-capture-provider".to_string()),
+            agent_alias: Arc::new("task8-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            memory: Arc::clone(&memory),
+            memory_strategy: Arc::new(memory_strategy),
+            tools_registry: Arc::new(Vec::new()),
+            observer: Arc::new(ValidationObserver),
+            system_prompt: Arc::new(stable_system_prompt()),
+            model: Arc::new("task8-synthetic-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(workspace_dir.clone()),
+            message_timeout_secs: MIN_CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: false,
+            show_tool_calls: false,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+        });
+
+        let msg = synthetic_message(variant);
+        let history_key = conversation_history_key(&msg);
+        seed_stable_history(runtime_ctx.as_ref(), &history_key);
+        memory
+            .store(
+                &format!("task8-memory-{}", variant.memory_marker),
+                &format!(
+                    "quartz daemon fallback memory {VOLATILE_MEMORY_MARKER}-{}",
+                    variant.memory_marker
+                ),
+                zeroclaw_memory::MemoryCategory::Conversation,
+                Some(&history_key),
+            )
+            .await?;
+
+        process_channel_message(runtime_ctx, msg, CancellationToken::new()).await;
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let turns = calls
+            .first()
+            .cloned()
+            .context("capture provider should receive one orchestrator payload")?;
+        Ok(ProviderPayloadCapture { turns })
+    }
+
+    fn synthetic_message(variant: &ProbeVariant<'_>) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            id: format!("{VOLATILE_MESSAGE_ID_MARKER}-{}", variant.message_id_marker),
+            sender: "task8-synthetic-sender".to_string(),
+            reply_target: "task8-synthetic-channel".to_string(),
+            content: format!(
+                "quartz cache validation {CURRENT_USER_MARKER}-{}",
+                variant.current_user_marker
+            ),
+            channel: "discord".to_string(),
+            channel_alias: Some("task8".to_string()),
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: None,
+        }
+    }
+
+    fn seed_stable_history(ctx: &ChannelRuntimeContext, history_key: &str) {
+        let mut histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        histories.push(
+            history_key.to_string(),
+            vec![
+                ChatMessage::user(stable_history_content()),
+                ChatMessage::assistant("TASK8_STABLE_ASSISTANT_ACK"),
+            ],
+        );
+    }
+
+    fn stable_system_prompt() -> String {
+        format!(
+            "{STABLE_SYSTEM_MARKER} {}",
+            "stable daemon and Discord runtime-command policy. ".repeat(300)
+        )
+    }
+
+    fn stable_history_content() -> String {
+        let mut content = String::with_capacity(54_000);
+        content.push_str(STABLE_HISTORY_MARKER_BEGIN);
+        content.push('\n');
+        for index in 0..560 {
+            let _ = writeln!(
+                content,
+                "Stable task8 daemon-equivalent cache ledger line {index:04}: quartz raven delta keeps deterministic provider-prefix bytes unchanged across comparable synthetic Discord turns."
+            );
+        }
+        content.push_str(STABLE_HISTORY_MARKER_END);
+        content.push('\n');
+        content
+    }
+
+    fn validation_workspace_dir(variant: &ProbeVariant<'_>) -> anyhow::Result<PathBuf> {
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)?
+            .as_nanos();
+        Ok(std::env::temp_dir().join(format!(
+            "zeroclaw-task8-cache-{}-{nanos}-{}-{}-{}",
+            std::process::id(),
+            variant.memory_marker,
+            variant.message_id_marker,
+            variant.current_user_marker
+        )))
+    }
+
+    fn first_differing_byte(left: &str, right: &str) -> Option<usize> {
+        let common_len = left
+            .as_bytes()
+            .iter()
+            .zip(right.as_bytes())
+            .position(|(left, right)| left != right);
+        common_len.or_else(|| (left.len() != right.len()).then_some(left.len().min(right.len())))
+    }
+
+    struct PayloadMarkers {
+        stable_system_offset: usize,
+        stable_history_offset: usize,
+        stable_history_end_offset: usize,
+        volatile_context_offset: usize,
+        current_user_offset: usize,
+    }
+
+    impl PayloadMarkers {
+        fn from_body(body: &str) -> anyhow::Result<Self> {
+            let marker_offset = |marker: &str| {
+                body.find(marker)
+                    .with_context(|| format!("provider payload missing marker {marker}"))
+            };
+            marker_offset(VOLATILE_MEMORY_MARKER)?;
+            marker_offset(VOLATILE_MESSAGE_ID_MARKER)?;
+            let current_user_marker_offset = marker_offset(CURRENT_USER_MARKER)?;
+            let current_user_turn_offset = body[..current_user_marker_offset]
+                .rfind("[\"user\",\"")
+                .with_context(|| "provider payload missing current user turn start")?;
+            Ok(Self {
+                stable_system_offset: marker_offset(STABLE_SYSTEM_MARKER)?,
+                stable_history_offset: marker_offset(STABLE_HISTORY_MARKER_BEGIN)?,
+                stable_history_end_offset: marker_offset(STABLE_HISTORY_MARKER_END)?,
+                volatile_context_offset: marker_offset("<zeroclaw_current_context>")?,
+                current_user_offset: current_user_turn_offset,
+            })
+        }
+
+        fn classify(&self, offset: usize) -> &'static str {
+            let volatile_or_current_offset =
+                self.current_user_offset.min(self.volatile_context_offset);
+            if offset < self.stable_system_offset {
+                "BEFORE_STABLE_SYSTEM"
+            } else if offset < self.stable_history_offset {
+                "STABLE_SYSTEM"
+            } else if offset <= self.stable_history_end_offset {
+                "STABLE_HISTORY"
+            } else if offset >= volatile_or_current_offset {
+                "VOLATILE_CONTEXT_OR_CURRENT_USER"
+            } else {
+                "AFTER_STABLE_BEFORE_VOLATILE"
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10090,6 +10675,112 @@ temperature = 0.3
             .iter()
             .map(|turn| (turn.role.clone(), turn.content.clone()))
             .collect()
+    }
+
+    fn history_json(turns: &[ChatMessage]) -> String {
+        serde_json::to_string(turns).unwrap()
+    }
+
+    fn history_with_old_tool_context_before_keep_boundary() -> Vec<ChatMessage> {
+        let mut turns = vec![
+            ChatMessage::user("turn 1"),
+            ChatMessage::assistant("{\"tool_call\": \"shell\"}"),
+            ChatMessage::tool("tool result 1"),
+            ChatMessage::assistant("turn 1 done"),
+        ];
+
+        for idx in 2..=9 {
+            turns.push(ChatMessage::user(format!("turn {idx}")));
+            turns.push(ChatMessage::assistant(format!("turn {idx} done")));
+        }
+
+        turns
+    }
+
+    fn history_with_only_user_turns(user_turns: usize) -> Vec<ChatMessage> {
+        let mut turns = Vec::with_capacity(user_turns * 2);
+
+        for idx in 1..=user_turns {
+            turns.push(ChatMessage::user(format!("turn {idx}")));
+            turns.push(ChatMessage::assistant(format!("turn {idx} done")));
+        }
+
+        turns
+    }
+
+    #[tokio::test]
+    async fn strip_old_tool_context_does_not_mutate_persisted_history() {
+        let channel: Arc<dyn Channel> = mention_mock("strip-old-tool-context", "@strip");
+        let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
+
+        let mut agent_cfg = zeroclaw_config::schema::AliasedAgentConfig::default();
+        agent_cfg.resolved.keep_tool_context_turns = 8;
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider_impl.clone(),
+            zeroclaw_config::schema::Config::default(),
+            agent_cfg,
+            "test-provider",
+        );
+
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "msg-strip-old-tool-context".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-strip-old-tool-context".to_string(),
+            content: "current turn".to_string(),
+            channel: "strip-old-tool-context".into(),
+            channel_alias: None,
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: None,
+        };
+        let history_key = conversation_history_key(&msg);
+        let original_history = history_with_old_tool_context_before_keep_boundary();
+        let original_history_json = history_json(&original_history);
+
+        seed_sender_history(runtime_ctx.as_ref(), &history_key, original_history.clone());
+
+        process_channel_message(runtime_ctx.clone(), msg.clone(), CancellationToken::new()).await;
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls.len(), 1);
+
+        let send_copy = &calls[0];
+        assert!(
+            send_copy.iter().all(|(role, content)| {
+                role != "tool"
+                    && !(role == "assistant" && content.contains("tool_call"))
+                    && !content.contains("<tool_call>")
+            }),
+            "provider send copy still contains old tool/tool-call history: {send_copy:?}"
+        );
+
+        let persisted_after = cloned_sender_history(runtime_ctx.as_ref(), &history_key);
+        let persisted_prefix_json = history_json(&persisted_after[..original_history.len()]);
+        assert_eq!(
+            persisted_prefix_json, original_history_json,
+            "persisted history prefix must stay byte-identical while the send copy is stripped"
+        );
+    }
+
+    #[test]
+    fn send_time_tool_strip_noop_without_old_tool_messages() {
+        let original_history = history_with_only_user_turns(9);
+        let mut send_copy = original_history.clone();
+
+        strip_old_tool_context(&mut send_copy, 8);
+
+        assert_eq!(
+            history_json(&send_copy),
+            history_json(&original_history),
+            "plain 9+ turn histories without old tool context must remain unchanged"
+        );
     }
 
     #[test]
@@ -16147,6 +16838,48 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(parse_runtime_command("telegram", "/clear all"), None);
     }
 
+    #[test]
+    fn parse_runtime_command_strips_leading_discord_mention() {
+        assert_eq!(
+            parse_runtime_command("discord", "<@12345> /new"),
+            Some(ChannelRuntimeCommand::NewSession)
+        );
+        assert_eq!(
+            parse_runtime_command("discord", "<@!12345> /clear"),
+            Some(ChannelRuntimeCommand::NewSession)
+        );
+        assert_eq!(
+            parse_runtime_command("discord", "<@&99999> /models openrouter"),
+            Some(ChannelRuntimeCommand::SetProvider("openrouter".into()))
+        );
+        assert_eq!(parse_runtime_command("telegram", "<@12345> /new"), None);
+    }
+
+    #[test]
+    fn parse_runtime_command_accepts_discord_bang_prefix() {
+        assert_eq!(
+            parse_runtime_command("discord", "!new"),
+            Some(ChannelRuntimeCommand::NewSession)
+        );
+        assert_eq!(
+            parse_runtime_command("discord", "!clear"),
+            Some(ChannelRuntimeCommand::NewSession)
+        );
+        assert_eq!(
+            parse_runtime_command("discord", "!models openrouter"),
+            Some(ChannelRuntimeCommand::SetProvider("openrouter".into()))
+        );
+        assert_eq!(
+            parse_runtime_command("discord", "!model qwen-max"),
+            Some(ChannelRuntimeCommand::SetModel("qwen-max".into()))
+        );
+        assert_eq!(
+            parse_runtime_command("discord", "!config"),
+            Some(ChannelRuntimeCommand::ShowConfig)
+        );
+        assert_eq!(parse_runtime_command("telegram", "!new"), None);
+    }
+
     /// `/models <family>` must resolve to a configured alias-backed ref so the
     /// switched provider uses the alias entry's key/URI — never construct a bare
     /// family provider that ignores `[providers.models.<family>.<alias>]`.
@@ -16736,6 +17469,203 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn volatile_context_is_send_time_only() {
+        const VOLATILE_MEMORY_MARKER: &str = "VOLATILE_MEMORY_MARKER";
+        const VOLATILE_MESSAGE_ID_MARKER: &str = "VOLATILE_MESSAGE_ID_MARKER";
+        const DYNAMIC_CHANNEL_MARKER: &str = "dynamic-channel-marker";
+
+        let channel: Arc<dyn Channel> = mention_mock(DYNAMIC_CHANNEL_MARKER, "@marker");
+        let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
+
+        let tmp = TempDir::new().unwrap();
+        let memory: Arc<dyn zeroclaw_api::memory_traits::Memory> =
+            Arc::new(SqliteMemory::new("volatile_context_is_send_time_only", tmp.path()).unwrap());
+
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: VOLATILE_MESSAGE_ID_MARKER.into(),
+            sender: "alice".into(),
+            reply_target: "chat-volatile".into(),
+            content: "quartz please respond".into(),
+            channel: DYNAMIC_CHANNEL_MARKER.into(),
+            channel_alias: None,
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: None,
+        };
+        let history_key = conversation_history_key(&msg);
+
+        memory
+            .store(
+                &conversation_memory_key(&msg),
+                "quartz recalled memory VOLATILE_MEMORY_MARKER",
+                MemoryCategory::Conversation,
+                Some(&history_key),
+            )
+            .await
+            .unwrap();
+
+        let mut runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider_impl.clone(),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+        );
+        Arc::get_mut(&mut runtime_ctx).unwrap().memory = Arc::clone(&memory);
+
+        process_channel_message(runtime_ctx.clone(), msg.clone(), CancellationToken::new()).await;
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls.len(), 1);
+
+        let call = &calls[0];
+        let system_prompt = call
+            .iter()
+            .find(|(role, _)| role == "system")
+            .map(|(_, content)| content.as_str())
+            .expect("provider call should include a system prompt");
+        let current_user = call
+            .iter()
+            .rev()
+            .find(|(role, _)| role == "user")
+            .map(|(_, content)| content.as_str())
+            .expect("provider call should include the current user message");
+
+        assert!(
+            current_user.contains(VOLATILE_MEMORY_MARKER),
+            "volatile memory marker must be inserted into the send-time user clone, got: {current_user}"
+        );
+        assert!(
+            current_user.contains(VOLATILE_MESSAGE_ID_MARKER),
+            "volatile message id marker must be inserted into the send-time user clone, got: {current_user}"
+        );
+        assert!(
+            current_user.contains(DYNAMIC_CHANNEL_MARKER),
+            "volatile channel marker must be inserted into the send-time user clone, got: {current_user}"
+        );
+        assert!(
+            !system_prompt.contains(VOLATILE_MEMORY_MARKER)
+                && !system_prompt.contains(VOLATILE_MESSAGE_ID_MARKER)
+                && !system_prompt.contains(DYNAMIC_CHANNEL_MARKER),
+            "volatile markers must not be appended to the system prompt, got: {system_prompt}"
+        );
+
+        let histories = runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = histories
+            .peek(&history_key)
+            .expect("history should be stored for the current sender");
+        assert!(
+            turns.iter().all(|turn| {
+                !turn.content.contains(VOLATILE_MEMORY_MARKER)
+                    && !turn.content.contains(VOLATILE_MESSAGE_ID_MARKER)
+                    && !turn.content.contains(DYNAMIC_CHANNEL_MARKER)
+            }),
+            "volatile markers must not be persisted in conversation history, got: {turns:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn volatile_context_empty_memory_case() {
+        const VOLATILE_MEMORY_MARKER: &str = "VOLATILE_MEMORY_MARKER";
+        const VOLATILE_MESSAGE_ID_MARKER: &str = "VOLATILE_MESSAGE_ID_MARKER";
+        const DYNAMIC_CHANNEL_MARKER: &str = "dynamic-channel-marker";
+
+        let channel: Arc<dyn Channel> = mention_mock(DYNAMIC_CHANNEL_MARKER, "@marker");
+        let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
+
+        let tmp = TempDir::new().unwrap();
+        let memory: Arc<dyn zeroclaw_api::memory_traits::Memory> =
+            Arc::new(SqliteMemory::new("volatile_context_empty_memory_case", tmp.path()).unwrap());
+
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: VOLATILE_MESSAGE_ID_MARKER.into(),
+            sender: "alice".into(),
+            reply_target: "chat-empty-memory".into(),
+            content: "plain follow up without recalled memory".into(),
+            channel: DYNAMIC_CHANNEL_MARKER.into(),
+            channel_alias: None,
+            timestamp: 2,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: None,
+        };
+
+        let mut runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider_impl.clone(),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+        );
+        Arc::get_mut(&mut runtime_ctx).unwrap().memory = Arc::clone(&memory);
+
+        process_channel_message(runtime_ctx.clone(), msg.clone(), CancellationToken::new()).await;
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls.len(), 1);
+
+        let call = &calls[0];
+        let system_prompt = call
+            .iter()
+            .find(|(role, _)| role == "system")
+            .map(|(_, content)| content.as_str())
+            .expect("provider call should include a system prompt");
+        let current_user = call
+            .iter()
+            .rev()
+            .find(|(role, _)| role == "user")
+            .map(|(_, content)| content.as_str())
+            .expect("provider call should include the current user message");
+
+        assert!(
+            current_user.contains(VOLATILE_MESSAGE_ID_MARKER),
+            "volatile message id marker must still be present when there is no recalled memory, got: {current_user}"
+        );
+        assert!(
+            current_user.contains(DYNAMIC_CHANNEL_MARKER),
+            "volatile channel marker must still be present when there is no recalled memory, got: {current_user}"
+        );
+        assert!(
+            !current_user.contains(VOLATILE_MEMORY_MARKER),
+            "empty memory must not emit a bogus memory section, got: {current_user}"
+        );
+        assert!(
+            !system_prompt.contains(VOLATILE_MESSAGE_ID_MARKER)
+                && !system_prompt.contains(DYNAMIC_CHANNEL_MARKER)
+                && !system_prompt.contains(VOLATILE_MEMORY_MARKER),
+            "volatile markers must not be appended to the system prompt when memory is empty, got: {system_prompt}"
+        );
+
+        let histories = runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = histories
+            .peek(&conversation_history_key(&msg))
+            .expect("history should be stored for the current sender");
+        assert!(
+            turns.iter().all(|turn| {
+                !turn.content.contains(VOLATILE_MEMORY_MARKER)
+                    && !turn.content.contains(VOLATILE_MESSAGE_ID_MARKER)
+                    && !turn.content.contains(DYNAMIC_CHANNEL_MARKER)
+            }),
+            "volatile markers must not be persisted in conversation history, got: {turns:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn process_channel_message_refreshes_available_skills_after_new_session() {
         let workspace = make_workspace();
         let mut config = Config {
@@ -17065,30 +17995,76 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap_or_else(|e| e.into_inner());
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].len(), 2);
-        // Memory context is injected into the system prompt, not the user message.
         assert_eq!(calls[0][0].0, "system");
-        assert!(calls[0][0].1.contains(MEMORY_CONTEXT_OPEN));
-        assert!(calls[0][0].1.contains("Age is 45"));
         assert!(
-            calls[0][0]
-                .1
-                .contains("Current-channel peer map for agent \"test-agent\"")
+            !calls[0][0].1.contains(MEMORY_CONTEXT_OPEN)
+                && !calls[0][0].1.contains("Age is 45")
+                && !calls[0][0]
+                    .1
+                    .contains("Current-channel peer map for agent \"test-agent\"")
+                && !calls[0][0].1.contains("peer groups: \"current-room\"")
+                && !calls[0][0]
+                    .1
+                    .contains("use channel ref \"test-channel.default\"")
+                && !calls[0][0].1.contains("agent peers: \"peer-agent\"")
+                && !calls[0][0].1.contains("external peers: \"operator\"")
+                && !calls[0][0].1.contains("<zeroclaw_current_context>")
+                && !calls[0][0].1.contains("</zeroclaw_current_context>"),
+            "volatile memory/current context must not be appended to the system prompt, got: {}",
+            calls[0][0].1
         );
-        assert!(calls[0][0].1.contains("peer groups: \"current-room\""));
-        assert!(
-            calls[0][0]
-                .1
-                .contains("use channel ref \"test-channel.default\"")
-        );
-        assert!(calls[0][0].1.contains("agent peers: \"peer-agent\""));
-        assert!(calls[0][0].1.contains("external peers: \"operator\""));
-        assert!(!calls[0][0].1.contains("\"other-room\""));
-        assert!(!calls[0][0].1.contains("\"other-agent\""));
         assert_eq!(calls[0][1].0, "user");
-        assert!(calls[0][1].1.starts_with('['));
+        assert!(
+            calls[0][1].1.contains("<zeroclaw_current_context>"),
+            "volatile context must be present in the send-time current user clone, got: {}",
+            calls[0][1].1
+        );
+        assert!(
+            calls[0][1].1.contains(MEMORY_CONTEXT_OPEN),
+            "volatile memory context must be present in the send-time current user clone, got: {}",
+            calls[0][1].1
+        );
+        assert!(
+            calls[0][1]
+                .1
+                .contains("Current-channel peer map for agent \"test-agent\""),
+            "volatile peer context must be present in the send-time current user clone, got: {}",
+            calls[0][1].1
+        );
+        assert!(
+            calls[0][1].1.contains("peer groups: \"current-room\""),
+            "peer-group details must be present in the send-time current user clone, got: {}",
+            calls[0][1].1
+        );
+        assert!(
+            calls[0][1]
+                .1
+                .contains("use channel ref \"test-channel.default\""),
+            "channel reference details must be present in the send-time current user clone, got: {}",
+            calls[0][1].1
+        );
+        assert!(
+            calls[0][1].1.contains("agent peers: \"peer-agent\""),
+            "peer list must be present in the send-time current user clone, got: {}",
+            calls[0][1].1
+        );
+        assert!(
+            calls[0][1].1.contains("external peers: \"operator\""),
+            "external peer list must be present in the send-time current user clone, got: {}",
+            calls[0][1].1
+        );
         assert!(
             calls[0][1].1.contains("] hello"),
-            "current channel user turn should be timestamped: {}",
+            "original current user content must still be present with volatile context: {}",
+            calls[0][1].1
+        );
+        assert!(
+            calls[0][1]
+                .1
+                .find("<zeroclaw_current_context>")
+                .zip(calls[0][1].1.find("] hello"))
+                .is_some_and(|(context_offset, user_offset)| context_offset > user_offset),
+            "stable current user bytes must precede volatile context for prompt-cache reuse: {}",
             calls[0][1].1
         );
 
@@ -17107,6 +18083,85 @@ BTC is currently around $65,000 based on latest tool output."#
             turns[0].content
         );
         assert!(!turns[0].content.contains(MEMORY_CONTEXT_OPEN));
+        assert!(!turns[0].content.contains("Current-channel peer map"));
+        assert!(!turns[0].content.contains("<zeroclaw_current_context>"));
+    }
+
+    #[tokio::test]
+    async fn current_user_turn_stable_prefix_matches_when_aged_to_history() {
+        let channel: Arc<dyn Channel> = mention_mock("cache-stable-channel", "@marker");
+        let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider_impl.clone(),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+        );
+
+        let first_msg = zeroclaw_api::channel::ChannelMessage {
+            id: "cache-stable-msg-1".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "cache-stable-chat".to_string(),
+            content: "cache-stable first turn".to_string(),
+            channel: "cache-stable-channel".into(),
+            channel_alias: None,
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: None,
+        };
+        let second_msg = zeroclaw_api::channel::ChannelMessage {
+            id: "cache-stable-msg-2".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "cache-stable-chat".to_string(),
+            content: "cache-stable second turn".to_string(),
+            channel: "cache-stable-channel".into(),
+            channel_alias: None,
+            timestamp: 2,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: None,
+        };
+
+        process_channel_message(runtime_ctx.clone(), first_msg, CancellationToken::new()).await;
+        process_channel_message(runtime_ctx, second_msg, CancellationToken::new()).await;
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls.len(), 2);
+
+        let first_current_user = calls[0]
+            .iter()
+            .find(|(role, content)| role == "user" && content.contains("cache-stable first turn"))
+            .map(|(_, content)| content.as_str())
+            .expect("first provider call should include first turn as current user");
+        let aged_history_user = calls[1]
+            .iter()
+            .find(|(role, content)| role == "user" && content.contains("cache-stable first turn"))
+            .map(|(_, content)| content.as_str())
+            .expect("second provider call should include first turn as history");
+
+        assert!(
+            !aged_history_user.contains("<zeroclaw_current_context>"),
+            "aged history turn must not persist volatile context: {aged_history_user}"
+        );
+        assert!(
+            first_current_user.starts_with(aged_history_user),
+            "current-turn stable prefix must match the same turn aged into history; \
+             current={first_current_user:?}, aged={aged_history_user:?}"
+        );
+        assert!(
+            first_current_user
+                .find("<zeroclaw_current_context>")
+                .is_some_and(|context_offset| context_offset > aged_history_user.len()),
+            "volatile context should appear only after the stable current-turn bytes: \
+             {first_current_user}"
+        );
     }
 
     #[tokio::test]
@@ -17315,6 +18370,137 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(turns[0].content.contains("please inspect this"));
         assert!(!turns[0].content.contains("[IMAGE:data:"));
         assert!(!turns[0].content.contains("AQIDBA"));
+    }
+
+    #[tokio::test]
+    async fn volatile_context_preserves_multimodal_current_user() {
+        const VOLATILE_MEMORY_MARKER: &str = "VOLATILE_MEMORY_MARKER";
+        const VOLATILE_MESSAGE_ID_MARKER: &str = "VOLATILE_MESSAGE_ID_MARKER";
+        const DYNAMIC_CHANNEL_MARKER: &str = "dynamic-channel-marker";
+
+        let channel: Arc<dyn Channel> = mention_mock(DYNAMIC_CHANNEL_MARKER, "@marker");
+        let provider_impl = Arc::new(HistoryCaptureModelProvider {
+            vision: true,
+            ..Default::default()
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let memory: Arc<dyn zeroclaw_api::memory_traits::Memory> = Arc::new(
+            SqliteMemory::new(
+                "volatile_context_preserves_multimodal_current_user",
+                tmp.path(),
+            )
+            .unwrap(),
+        );
+
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: VOLATILE_MESSAGE_ID_MARKER.into(),
+            sender: "alice".into(),
+            reply_target: "chat-image-volatile".into(),
+            content: "please inspect this screenshot".into(),
+            channel: DYNAMIC_CHANNEL_MARKER.into(),
+            channel_alias: None,
+            timestamp: 3,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![zeroclaw_api::media::MediaAttachment {
+                file_name: "diagram.png".to_string(),
+                data: vec![1, 2, 3, 4],
+                mime_type: Some("image/png".to_string()),
+            }],
+            subject: None,
+        };
+        let history_key = conversation_history_key(&msg);
+
+        memory
+            .store(
+                &conversation_memory_key(&msg),
+                "screenshot image recall VOLATILE_MEMORY_MARKER",
+                MemoryCategory::Conversation,
+                Some(&history_key),
+            )
+            .await
+            .unwrap();
+
+        let mut runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider_impl.clone(),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+        );
+        Arc::get_mut(&mut runtime_ctx).unwrap().memory = Arc::clone(&memory);
+
+        process_channel_message(runtime_ctx.clone(), msg.clone(), CancellationToken::new()).await;
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls.len(), 1);
+
+        let call = &calls[0];
+        let system_prompt = call
+            .iter()
+            .find(|(role, _)| role == "system")
+            .map(|(_, content)| content.as_str())
+            .expect("provider call should include a system prompt");
+        let current_user = call
+            .iter()
+            .rev()
+            .find(|(role, _)| role == "user")
+            .map(|(_, content)| content.as_str())
+            .expect("provider call should include the current user message");
+
+        let image_payload = "[IMAGE:data:image/png;base64,";
+        let _image_pos = current_user
+            .find(image_payload)
+            .expect("current user send-time clone should keep the image payload");
+        let volatile_pos = current_user
+            .find(VOLATILE_MEMORY_MARKER)
+            .expect("volatile memory marker should be present in the current user send-time clone");
+        let text_pos = current_user
+            .find("please inspect this screenshot")
+            .expect("current user send-time clone should keep the original text");
+        assert!(
+            volatile_pos > text_pos,
+            "stable multimodal history bytes must precede volatile context for prompt-cache reuse, got: {current_user}"
+        );
+        assert!(
+            current_user.contains(VOLATILE_MESSAGE_ID_MARKER)
+                && current_user.contains(DYNAMIC_CHANNEL_MARKER)
+                && current_user.contains("please inspect this screenshot")
+                && current_user.contains(image_payload),
+            "current user send-time clone must preserve both the volatile context and the multimodal payload, got: {current_user}"
+        );
+        assert!(
+            !system_prompt.contains(VOLATILE_MEMORY_MARKER)
+                && !system_prompt.contains(VOLATILE_MESSAGE_ID_MARKER)
+                && !system_prompt.contains(DYNAMIC_CHANNEL_MARKER),
+            "volatile markers must not be appended to the system prompt, got: {system_prompt}"
+        );
+
+        let histories = runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = histories
+            .peek(&history_key)
+            .expect("history should be stored for the current sender");
+        assert!(
+            turns.iter().all(|turn| {
+                !turn.content.contains(VOLATILE_MEMORY_MARKER)
+                    && !turn.content.contains(VOLATILE_MESSAGE_ID_MARKER)
+                    && !turn.content.contains(DYNAMIC_CHANNEL_MARKER)
+            }),
+            "volatile markers must not be persisted in conversation history, got: {turns:?}"
+        );
+        assert!(
+            turns[0].content.contains("[Image: diagram.png attached]")
+                && !turns[0].content.contains("[IMAGE:data:")
+                && !turns[0].content.contains("AQIDBA"),
+            "persisted history should keep the compact image form without flattening the payload, got: {turns:?}"
+        );
     }
 
     #[tokio::test]
@@ -20392,9 +21578,8 @@ Done."#;
             ],
         );
 
-        strip_old_tool_context(ctx.as_ref(), sender, 2);
-
-        let turns = cloned_sender_history(ctx.as_ref(), sender);
+        let mut turns = cloned_sender_history(ctx.as_ref(), sender);
+        strip_old_tool_context(&mut turns, 2);
         assert_eq!(
             turns.len(),
             4,
@@ -20424,9 +21609,8 @@ Done."#;
             ],
         );
 
-        strip_old_tool_context(ctx.as_ref(), sender, 2);
-
-        let turns = cloned_sender_history(ctx.as_ref(), sender);
+        let mut turns = cloned_sender_history(ctx.as_ref(), sender);
+        strip_old_tool_context(&mut turns, 2);
         assert_eq!(
             history_signature(&turns),
             vec![
@@ -20462,9 +21646,8 @@ Done."#;
             ],
         );
 
-        strip_old_tool_context(ctx.as_ref(), sender, 1);
-
-        let turns = cloned_sender_history(ctx.as_ref(), sender);
+        let mut turns = cloned_sender_history(ctx.as_ref(), sender);
+        strip_old_tool_context(&mut turns, 1);
         assert_eq!(
             history_signature(&turns),
             vec![
@@ -20503,13 +21686,11 @@ Done."#;
 
     #[test]
     fn build_channel_system_prompt_includes_sender_id() {
-        let prompt = build_channel_system_prompt(
-            "You are a helpful assistant.",
+        let prompt = build_channel_current_context(
             "mattermost",
             "channel123:root456",
             "user_abc123",
             "msg-xyz789",
-            None,
         );
         // Pin the comma-separated tuple in the format string so a refactor
         // that splits, reorders, or rewords the context block fails loudly
@@ -20525,36 +21706,17 @@ Done."#;
 
     #[test]
     fn build_channel_system_prompt_omits_context_when_reply_target_empty() {
-        let prompt = build_channel_system_prompt(
-            "Base prompt.",
-            "mattermost",
-            "",
-            "user_abc123",
-            "msg-xyz789",
-            None,
-        );
+        let prompt = build_channel_system_prompt("Base prompt.", "mattermost", None);
         assert!(!prompt.contains("sender="));
         assert!(!prompt.contains("Channel context:"));
     }
 
     #[test]
     fn build_channel_system_prompt_sender_distinguishes_users() {
-        let prompt_a = build_channel_system_prompt(
-            "Base.",
-            "mattermost",
-            "ch:thread",
-            "user_aaa",
-            "msg-1",
-            None,
-        );
-        let prompt_b = build_channel_system_prompt(
-            "Base.",
-            "mattermost",
-            "ch:thread",
-            "user_bbb",
-            "msg-1",
-            None,
-        );
+        let prompt_a =
+            build_channel_current_context("mattermost", "ch:thread", "user_aaa", "msg-1");
+        let prompt_b =
+            build_channel_current_context("mattermost", "ch:thread", "user_bbb", "msg-1");
         assert!(prompt_a.contains("sender=user_aaa"));
         assert!(prompt_b.contains("sender=user_bbb"));
         assert_ne!(prompt_a, prompt_b);
@@ -20565,9 +21727,6 @@ Done."#;
         let prompt = build_channel_system_prompt(
             "Base.\n\n## Current Date\n\nProject note, not generated date context.\n\n## Current Date & Time\n\n2026-01-01 01:02:03 (UTC)\n\n## Runtime\n\nHost: old\n",
             "mattermost",
-            "ch:thread",
-            "user_aaa",
-            "msg-1",
             None,
         );
 
@@ -20599,9 +21758,6 @@ Done."#;
         let prompt = build_channel_system_prompt(
             "Base.\n\n## Current Date\n\n2026-01-01 (+00:00)\n\n## Runtime\n\nHost: old\n",
             "mattermost",
-            "ch:thread",
-            "user_aaa",
-            "msg-1",
             None,
         );
 
@@ -20625,7 +21781,7 @@ Done."#;
         // is expected to see so a future refactor adding more fields can't
         // silently drop existing ones.
         let msg = channel_message("discord", None);
-        let prompt = build_channel_system_prompt_for_message("Base.", &msg, None);
+        let prompt = build_channel_current_context_for_message(&msg);
         assert!(
             prompt.contains("channel=discord, reply_target=r1, sender=u1, message_id=m1"),
             "wrapper did not propagate channel/reply_target/sender/message_id \
@@ -20639,13 +21795,11 @@ Done."#;
         // id, not a recipient. Using it as `delivery.to` would strip the thread
         // context from the cron-announce callback (see #6634). The hint must
         // place the sender in `to` and the reply_target in `thread_id`.
-        let prompt = build_channel_system_prompt(
-            "Base.",
+        let prompt = build_channel_current_context(
             "webhook",
             "agent-chat:agent-1:thread-7",
             "user:abc",
             "msg-1",
-            None,
         );
         assert!(
             prompt.contains("\"to\":\"user:abc\""),
@@ -20663,8 +21817,7 @@ Done."#;
 
     #[test]
     fn build_channel_system_prompt_non_webhook_cron_hint_keeps_to_as_reply_target() {
-        let prompt =
-            build_channel_system_prompt("Base.", "slack", "C12345", "U67890", "msg-1", None);
+        let prompt = build_channel_current_context("slack", "C12345", "U67890", "msg-1");
         assert!(
             prompt.contains("\"to\":\"C12345\""),
             "non-webhook cron hint should keep reply_target as `to`: {prompt}"
