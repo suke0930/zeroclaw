@@ -31,6 +31,30 @@ ZeroClaw is an agent runtime — a single Rust binary you configure and run. It 
 
 Read the [Philosophy](docs/book/src/philosophy/index.md) for the four opinions that shape it.
 
+## Fork focus: DeepSeek prompt-cache stability
+
+This fork tracks work to make DeepSeek prompt caching reliable for long-running ZeroClaw agent conversations. The goal is to keep the reusable prompt prefix byte-stable across turns while moving volatile data, such as current message ids and retrieved memory context, after the stable history boundary.
+
+The current branch implements the provider and orchestration changes needed for that shape: DeepSeek-compatible requests can expose raw prompt-cache hit and miss counters, the daemon-equivalent Discord/orchestrator path validates that volatile context does not disturb the stable prefix, and ignored validation tests can capture live or fallback evidence for prompt-cache behavior. In short, the fork now has both the runtime changes and regression coverage for keeping DeepSeek cacheable prefixes stable.
+
+### Installing this fork
+
+Install this fork from a checked-out source tree, not from the upstream `curl | bash` installer. The upstream installer and prebuilt update path fetch `zeroclaw-labs/zeroclaw` releases, so a fresh environment should clone this branch and run a source install:
+
+```bash
+git clone -b fix/deepseek-prompt-cache-prefix-stability https://github.com/suke0930/zeroclaw.git
+cd zeroclaw
+./install.sh --source --skip-quickstart
+```
+
+The default source build includes `channel-discord` through the `default-channels` feature bundle. Only use `--minimal` if you also pass the features you need explicitly, for example `--features agent-runtime,channel-discord`.
+
+### この fork のインストール
+
+この fork を新規環境に入れる場合は、上流の `curl | bash` インストーラではなく、このブランチを clone して source install してください。上流インストーラと prebuilt 更新経路は `zeroclaw-labs/zeroclaw` の release を取得するため、この fork の変更は入りません。
+
+通常は上の `./install.sh --source --skip-quickstart` で十分です。デフォルトの source build には `default-channels` 経由で Discord 拡張 (`channel-discord`) も含まれます。`--minimal` を使う場合だけ、必要な feature を明示してください。
+
 ## Install
 
 ```bash
